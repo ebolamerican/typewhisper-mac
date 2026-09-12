@@ -31,20 +31,33 @@ struct WorkflowTextProcessingService {
         _ targetLanguageCode: String,
         _ sourceLanguageCode: String?
     ) async throws -> String
+    /// Supplies the spellings (dictionary terms and correction targets) that every LLM
+    /// workflow prompt must protect. Called per run so dictionary edits apply immediately.
+    typealias VocabularyProvider = @MainActor () -> [String]
+
     private let promptProcessor: PromptProcessor
     private let effortPromptProcessor: EffortPromptProcessor?
     private let appleTranslator: AppleTranslator?
+    private let vocabularyProvider: VocabularyProvider?
 
     init(
         promptProcessor: @escaping PromptProcessor,
-        appleTranslator: AppleTranslator?
+        appleTranslator: AppleTranslator?,
+        vocabularyProvider: VocabularyProvider? = nil
     ) {
         self.promptProcessor = promptProcessor
         self.effortPromptProcessor = nil
         self.appleTranslator = appleTranslator
+        self.vocabularyProvider = vocabularyProvider
     }
 
-    init(promptProcessingService: PromptProcessingService, translationService: AnyObject?, workflowService _: WorkflowService? = nil) {
+    init(
+        promptProcessingService: PromptProcessingService,
+        translationService: AnyObject?,
+        workflowService _: WorkflowService? = nil,
+        vocabularyProvider: VocabularyProvider? = nil
+    ) {
+        self.vocabularyProvider = vocabularyProvider
         self.promptProcessor = { prompt, text, providerId, cloudModel, temperatureDirective in
             try await promptProcessingService.processWorkflow(
                 prompt: prompt,
@@ -97,7 +110,7 @@ struct WorkflowTextProcessingService {
             let prompt = Self.inlineCommandSystemPrompt(
                 fineTuning: behavior.fineTuning,
                 outputInstruction: workflow.outputInstruction(resolvedOutputFormat: resolvedOutputFormat)
-            )
+            ) + vocabularyInstruction()
             if let effortPromptProcessor {
                 return try await effortPromptProcessor(
                     prompt,
@@ -127,7 +140,7 @@ struct WorkflowTextProcessingService {
             )
         }
 
-        guard let systemPrompt = workflow.systemPrompt(
+        guard let baseSystemPrompt = workflow.systemPrompt(
             fallbackTranslationTarget: fallbackTranslationTarget,
             detectedLanguage: detectedLanguage,
             configuredLanguage: configuredLanguage,
@@ -135,6 +148,7 @@ struct WorkflowTextProcessingService {
         ) else {
             return text
         }
+        let systemPrompt = baseSystemPrompt + vocabularyInstruction()
 
         let behavior = workflow.behavior
         if let effortPromptProcessor {
@@ -201,6 +215,23 @@ struct WorkflowTextProcessingService {
         let sourceLanguageCode = WorkflowTranslationLanguageNormalizer.normalizedLanguageIdentifier(from: sourceRaw)
 
         return try await appleTranslator(text, targetLanguageCode, sourceLanguageCode)
+    }
+
+    /// Appends the user's protected vocabulary to an LLM prompt so the model keeps the
+    /// speaker's own spellings instead of "correcting" them or re-punctuating a
+    /// misrecognition that a dictionary correction would otherwise have caught.
+    private func vocabularyInstruction() -> String {
+        guard let vocabularyProvider else { return "" }
+        let vocabulary = vocabularyProvider()
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !vocabulary.isEmpty else { return "" }
+        return """
+
+        Protected vocabulary:
+        The following are the speaker's own names, products, and spellings. When the dictated text contains one of them, or an obvious speech-to-text misrecognition of one, write it exactly as listed: never respell, split, hyphenate, translate, or "correct" it.
+        \(vocabulary.joined(separator: ", "))
+        """
     }
 
     private static func trimmedOrNil(_ value: String?) -> String? {

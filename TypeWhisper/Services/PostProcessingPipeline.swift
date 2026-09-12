@@ -58,7 +58,8 @@ final class PostProcessingPipeline {
         let plugins = PluginManager.shared.postProcessors
 
         // Build priority-ordered step list: (priority, id)
-        // IDs: -1 = LLM, -2 = snippets, -3 = dictionary, -4 = app formatter, -5 = punctuation, -6 = normalization, 0+ = plugin index
+        // IDs: -1 = LLM, -2 = snippets, -3 = dictionary, -4 = app formatter, -5 = punctuation, -6 = normalization,
+        //      -7 = dictionary (pre-LLM pass), 0+ = plugin index
         var steps: [(priority: Int, id: Int)] = []
 
         steps.append((100, -6))
@@ -72,6 +73,10 @@ final class PostProcessingPipeline {
         steps.append((200, -5))
 
         if llmHandler != nil {
+            // Apply dictionary corrections before the LLM sees the text as well as after it.
+            // The LLM otherwise rewrites the raw misrecognition (re-punctuates it, swaps a
+            // hyphen, drops a word) and the exact-match correction at 600 no longer fires.
+            steps.append((250, -7))
             steps.append((300, -1))
         }
         for (index, plugin) in plugins.enumerated() {
@@ -91,7 +96,7 @@ final class PostProcessingPipeline {
             case -5: return "Speech Punctuation"
             case -1: return llmStepName ?? "Prompt"
             case -2: return "Snippets"
-            case -3: return "Corrections"
+            case -3, -7: return "Corrections"
             default: return plugins[id].processorName
             }
         }
@@ -149,14 +154,14 @@ final class PostProcessingPipeline {
                     result = try await llmHandler!(result)
                 case -2:
                     result = snippetService.applySnippets(to: result)
-                case -3:
+                case -3, -7:
                     result = dictionaryService.applyCorrections(to: result)
                 default:
                     result = try await plugins[step.id].process(text: result, context: context)
                 }
                 let changed = result != before
                 logger.info("Post-processing step '\(name)' finished in \(ContinuousClock.now - stepStart), changed: \(changed)")
-                if changed {
+                if changed, !appliedSteps.contains(name) {
                     appliedSteps.append(name)
                 }
             } catch {
